@@ -1,0 +1,7 @@
+.{
+    .name = .j3lybin,
+    .version = "0.1.0",
+    .dependencies = .{},
+    .paths = .{""},
+    .fingerprint = 0x2fd74f738508cc85,
+}
