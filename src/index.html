@@ -57,7 +57,7 @@ if(b<1024)return b+'B';
 if(b<1048576)return(b/1024).toFixed(1)+'KB';
 return(b/1048576).toFixed(1)+'MB'
 }
-async function uploadChunk(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename){
+async function uploadChunkOnce(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename){
 const start=chunkIdx*chunkSize;
 const end=Math.min(start+chunkSize,file.size);
 const blob=file.slice(start,end);
@@ -90,6 +90,14 @@ x.setRequestHeader('X-Ttl',ttl);
 x.setRequestHeader('X-Total-Size',String(file.size));
 x.send(blob)
 });
+}
+async function uploadChunk(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename){
+let lastErr;
+for(let attempt=0;attempt<3;attempt++){
+try{return await uploadChunkOnce(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename)}
+catch(err){lastErr=err;if(attempt<2)await new Promise(r=>setTimeout(r,500))}
+}
+throw lastErr;
 }
 async function handleFile(file){
 if(!file)return;

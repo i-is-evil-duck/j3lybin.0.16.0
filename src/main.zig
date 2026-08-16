@@ -5,6 +5,10 @@ const net = std.Io.net;
 const MAX_FILE_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5GB
 const MAX_DAILY_PER_IP: u64 = 10 * 1024 * 1024 * 1024; // 10GB
 const CHUNK_SIZE: usize = 512 * 1024; // 512KB chunks
+const MAX_CHUNK_SIZE: usize = CHUNK_SIZE + 1024; // write-side cap for one chunk
+const MAX_CHUNKS: u32 = @intCast((MAX_FILE_SIZE + MAX_CHUNK_SIZE - 1) / MAX_CHUNK_SIZE);
+const DEFAULT_TTL: u64 = 48 * 3600;
+const MAX_TTL: u64 = 180 * 86400; // 6 months; must fit in i64 for expiry math
 const DATA_DIR = "data";
 const META_DIR = "data/meta";
 
@@ -89,21 +93,42 @@ const ServerState = struct {
     fn deinit(self: *ServerState) void {
         var it = self.uploads.iterator();
         while (it.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.*.deinit();
             self.allocator.destroy(entry.value_ptr.*);
         }
         self.uploads.deinit();
+
+        var qit = self.ip_quotas.iterator();
+        while (qit.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
+        }
         self.ip_quotas.deinit();
     }
 };
 
-var gpa = std.heap.GeneralPurposeAllocator(.{}){};
 var state: ServerState = undefined;
 
+// Builds a per-IP quota key. Must NOT include the source port, otherwise each
+// new TCP connection gets its own quota bucket and the daily limit never
+// triggers. `{any}`/`{f}` on an IpAddress include the port, so we format the
+// address bytes directly.
 fn getClientIP(addr: net.IpAddress) ![]u8 {
-    var buf: [64]u8 = undefined;
-    const ip_str = try std.fmt.bufPrint(&buf, "{any}", .{addr});
-    return try state.allocator.dupe(u8, ip_str);
+    return switch (addr) {
+        .ip4 => |ip4| {
+            const b = ip4.bytes;
+            return std.fmt.allocPrint(state.allocator, "{d}.{d}.{d}.{d}", .{ b[0], b[1], b[2], b[3] });
+        },
+        .ip6 => |ip6| {
+            const b = ip6.bytes;
+            // Group IPv4-mapped IPv6 addresses with their IPv4 peers.
+            if (std.mem.eql(u8, b[0..10], &[_]u8{0} ** 10) and b[10] == 0xff and b[11] == 0xff) {
+                return std.fmt.allocPrint(state.allocator, "{d}.{d}.{d}.{d}", .{ b[12], b[13], b[14], b[15] });
+            }
+            const value = std.mem.readInt(u128, b[0..16], .big);
+            return std.fmt.allocPrint(state.allocator, "{x}", .{value});
+        },
+    };
 }
 
 fn checkIPQuota(io: Io, ip: []const u8, file_size: u64) !bool {
@@ -113,6 +138,8 @@ fn checkIPQuota(io: Io, ip: []const u8, file_size: u64) !bool {
     const now = nowSecs(io);
     const gop = try state.ip_quotas.getOrPut(ip);
     if (!gop.found_existing) {
+        // Same ownership issue as uploads: `ip` is request-owned, so copy it.
+        gop.key_ptr.* = try state.allocator.dupe(u8, ip);
         gop.value_ptr.* = .{ .bytes_used = 0, .reset_at = now + 86400 };
     }
 
@@ -137,19 +164,31 @@ fn addIPQuota(ip: []const u8, bytes: u64) !void {
 }
 
 fn parseTTL(ttl_str: []const u8) u64 {
-    if (ttl_str.len < 2) return 48 * 3600;
-    const num = std.fmt.parseInt(u64, ttl_str[0 .. ttl_str.len - 1], 10) catch return 48 * 3600;
+    if (ttl_str.len < 2) return DEFAULT_TTL;
+    const num = std.fmt.parseInt(u64, ttl_str[0 .. ttl_str.len - 1], 10) catch return DEFAULT_TTL;
     const unit = ttl_str[ttl_str.len - 1];
-    return switch (unit) {
-        'm' => num * 60,
-        'h' => num * 3600,
-        'w' => num * 7 * 86400,
-        'M' => num * 30 * 86400,
-        else => 48 * 3600,
+    const multiplier: u64 = switch (unit) {
+        'm' => 60,
+        'h' => 3600,
+        'w' => 7 * 86400,
+        'M' => 30 * 86400,
+        else => return DEFAULT_TTL,
     };
+    // Clamp instead of silently wrapping in ReleaseFast, and keep the value in
+    // range for the i64 casts used by the expiry checks.
+    const ttl = std.math.mul(u64, num, multiplier) catch std.math.maxInt(u64);
+    return @min(ttl, MAX_TTL);
 }
 
-fn saveMeta(io: Io, upload_id: []const u8, meta: *const UploadMeta) !void {
+const MetaSnapshot = struct {
+    filename: []const u8,
+    total_size: u64,
+    total_chunks: u32,
+    ttl_seconds: u64,
+    created_at: i64,
+};
+
+fn saveMeta(io: Io, upload_id: []const u8, meta: MetaSnapshot) !void {
     const path = try std.fmt.allocPrint(state.allocator, "{s}/{s}.json", .{ META_DIR, upload_id });
     defer state.allocator.free(path);
 
@@ -170,7 +209,7 @@ fn saveMeta(io: Io, upload_id: []const u8, meta: *const UploadMeta) !void {
     try w.flush();
 }
 
-fn assembleFile(io: Io, upload_id: []const u8, meta: *const UploadMeta) !void {
+fn assembleFile(io: Io, upload_id: []const u8, total_chunks: u32) !void {
     const out_path = try std.fmt.allocPrint(state.allocator, "{s}/{s}.bin", .{ DATA_DIR, upload_id });
     defer state.allocator.free(out_path);
 
@@ -182,11 +221,14 @@ fn assembleFile(io: Io, upload_id: []const u8, meta: *const UploadMeta) !void {
     var w = out_file.writer(io, &write_buf);
 
     var i: u32 = 0;
-    while (i < meta.total_chunks) : (i += 1) {
+    while (i < total_chunks) : (i += 1) {
         const chunk_path = try std.fmt.allocPrint(state.allocator, "{s}/{s}.{d}", .{ DATA_DIR, upload_id, i });
         defer state.allocator.free(chunk_path);
 
-        const chunk_data = try cwd.readFileAlloc(io, chunk_path, state.allocator, .limited(CHUNK_SIZE));
+        // A chunk file can be up to MAX_CHUNK_SIZE bytes. Limiting to exactly
+        // CHUNK_SIZE makes readFileAlloc return error.StreamTooLong for every
+        // full-size chunk, breaking all multi-chunk uploads.
+        const chunk_data = try cwd.readFileAlloc(io, chunk_path, state.allocator, .limited(MAX_CHUNK_SIZE));
         defer state.allocator.free(chunk_data);
 
         try w.interface.writeAll(chunk_data);
@@ -202,6 +244,7 @@ fn sendResponse(writer: *std.Io.Writer, status: u16, content_type: []const u8, b
         403 => "Forbidden",
         404 => "Not Found",
         413 => "Payload Too Large",
+        500 => "Internal Server Error",
         else => "Unknown",
     };
     const header = try std.fmt.allocPrint(state.allocator,
@@ -238,6 +281,17 @@ fn sendFile(io: Io, writer: *std.Io.Writer, file_path: []const u8, content_type:
     }
 }
 
+// Extracts the numeric value of `"<name>: "` from the JSON metadata written by
+// saveMeta. Returns null if the field is missing or not an integer.
+fn jsonFieldInt(data: []const u8, comptime name: []const u8) ?i64 {
+    const needle = "\"" ++ name ++ "\": ";
+    const start = std.mem.indexOf(u8, data, needle) orelse return null;
+    var end = start + needle.len;
+    while (end < data.len and data[end] >= '0' and data[end] <= '9') : (end += 1) {}
+    if (end == start + needle.len) return null;
+    return std.fmt.parseInt(i64, data[start + needle.len .. end], 10) catch null;
+}
+
 fn sendDownload(io: Io, writer: *std.Io.Writer, upload_id: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     const meta_path = try std.fmt.allocPrint(state.allocator, "{s}/{s}.json", .{ META_DIR, upload_id });
@@ -256,6 +310,14 @@ fn sendDownload(io: Io, writer: *std.Io.Writer, upload_id: []const u8) !void {
         if (std.mem.indexOf(u8, meta_data[name_start..], "\"")) |end| {
             filename = meta_data[name_start .. name_start + end];
         }
+    }
+
+    // Enforce TTL even before the cleanup thread runs.
+    const created_at = jsonFieldInt(meta_data, "created_at") orelse 0;
+    const ttl_seconds = jsonFieldInt(meta_data, "ttl_seconds") orelse 0;
+    if (nowSecs(io) > created_at + @as(i64, @intCast(ttl_seconds))) {
+        try sendResponse(writer, 404, "text/plain", "Expired");
+        return;
     }
 
     const file_path = try std.fmt.allocPrint(state.allocator, "{s}/{s}.bin", .{ DATA_DIR, upload_id });
@@ -344,9 +406,93 @@ fn parseRequestHeaders(data: []const u8) !ParsedRequest {
     return result;
 }
 
+// Upload ids are generated by the frontend as base62; only allow alphanumerics
+// so they can never be used to escape the data/meta directories.
+fn isValidId(id: []const u8) bool {
+    if (id.len == 0 or id.len > 64) return false;
+    for (id) |c| {
+        if (!std.ascii.isAlphanumeric(c)) return false;
+    }
+    return true;
+}
+
+fn hexVal(c: u8) ?u8 {
+    return switch (c) {
+        '0'...'9' => c - '0',
+        'a'...'f' => c - 'a' + 10,
+        'A'...'F' => c - 'A' + 10,
+        else => null,
+    };
+}
+
+fn urlDecode(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    var out = try allocator.alloc(u8, input.len);
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < input.len) {
+        if (input[i] == '%' and i + 2 < input.len) {
+            const hi = hexVal(input[i + 1]) orelse {
+                out[n] = '%';
+                n += 1;
+                i += 1;
+                continue;
+            };
+            const lo = hexVal(input[i + 2]) orelse {
+                out[n] = '%';
+                n += 1;
+                i += 1;
+                continue;
+            };
+            out[n] = hi * 16 + lo;
+            n += 1;
+            i += 3;
+        } else {
+            out[n] = input[i];
+            n += 1;
+            i += 1;
+        }
+    }
+    return out[0..n];
+}
+
+// The web UI sends `encodeURIComponent(filename)`. Percent-decode it and strip
+// characters that are unsafe in file names, JSON strings, or HTTP header
+// values (which would allow CRLF header injection via the filename).
+fn sanitizeFilename(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const decoded = try urlDecode(allocator, raw);
+    defer allocator.free(decoded);
+
+    var out = try allocator.alloc(u8, decoded.len);
+    var n: usize = 0;
+    for (decoded) |c| {
+        out[n] = if (c < 0x20 or c == 0x7f or c == '"' or c == '\\') '_' else c;
+        n += 1;
+    }
+    return out[0..n];
+}
+
 fn handleChunkRequest(io: Io, addr: net.IpAddress, upload_id: []const u8, chunk_idx: u32, total_chunks: u32, filename: []const u8, ttl: []const u8, total_size: u64, body: []const u8, writer: *std.Io.Writer) !void {
     if (total_size > MAX_FILE_SIZE) {
         try sendResponse(writer, 413, "text/plain", "File too large (max 5GB)");
+        return;
+    }
+    if (total_chunks > MAX_CHUNKS) {
+        try sendResponse(writer, 400, "text/plain", "Invalid total chunks");
+        return;
+    }
+    if (chunk_idx >= total_chunks) {
+        try sendResponse(writer, 400, "text/plain", "Invalid chunk index");
+        return;
+    }
+    // Reject mismatched chunk sizes (also stops claiming a huge total_size
+    // while sending tiny chunks).
+    const offset: u64 = @as(u64, chunk_idx) * @as(u64, CHUNK_SIZE);
+    const expected: usize = if (offset >= total_size)
+        0
+    else
+        @intCast(@min(@as(u64, CHUNK_SIZE), total_size - offset));
+    if (body.len != expected) {
+        try sendResponse(writer, 400, "text/plain", "Chunk size mismatch");
         return;
     }
 
@@ -359,26 +505,38 @@ fn handleChunkRequest(io: Io, addr: net.IpAddress, upload_id: []const u8, chunk_
         return;
     }
 
-    state.mutex.lock();
+    // Create/refresh the upload entry and snapshot the metadata we need. We
+    // must not keep pointers into the map across the slow chunk write below:
+    // the cleanup thread may destroy the entry (and free its memory) if the
+    // TTL expires mid-upload.
+    var filename_copy: ?[]u8 = null;
+    defer if (filename_copy) |f| state.allocator.free(f);
+    const snapshot = snapshot: {
+        state.mutex.lock();
+        defer state.mutex.unlock();
 
-    const gop = try state.uploads.getOrPut(upload_id);
-    var meta: *UploadMeta = undefined;
+        const gop = try state.uploads.getOrPut(upload_id);
+        var meta: *UploadMeta = undefined;
+        if (!gop.found_existing) {
+            meta = try state.allocator.create(UploadMeta);
+            meta.* = try UploadMeta.init(state.allocator, io, filename, total_size, total_chunks, ttl_seconds);
+            // StringHashMap stores keys by reference; upload_id points into a
+            // per-request stack buffer, so own a copy of it here.
+            gop.key_ptr.* = try state.allocator.dupe(u8, upload_id);
+            gop.value_ptr.* = meta;
+        } else {
+            meta = gop.value_ptr.*;
+        }
 
-    if (!gop.found_existing) {
-        meta = try state.allocator.create(UploadMeta);
-        meta.* = try UploadMeta.init(state.allocator, io, filename, total_size, total_chunks, ttl_seconds);
-        gop.value_ptr.* = meta;
-    } else {
-        meta = gop.value_ptr.*;
-    }
-
-    if (chunk_idx >= meta.total_chunks) {
-        state.mutex.unlock();
-        try sendResponse(writer, 400, "text/plain", "Invalid chunk index");
-        return;
-    }
-
-    state.mutex.unlock();
+        filename_copy = try state.allocator.dupe(u8, meta.filename);
+        break :snapshot MetaSnapshot{
+            .filename = filename_copy.?,
+            .total_size = meta.total_size,
+            .total_chunks = meta.total_chunks,
+            .ttl_seconds = meta.ttl_seconds,
+            .created_at = meta.created_at,
+        };
+    };
 
     // Save chunk
     const chunk_path = try std.fmt.allocPrint(state.allocator, "{s}/{s}.{d}", .{ DATA_DIR, upload_id, chunk_idx });
@@ -390,14 +548,19 @@ fn handleChunkRequest(io: Io, addr: net.IpAddress, upload_id: []const u8, chunk_
     try chunk_file.writeStreamingAll(io, body);
 
     state.mutex.lock();
-    meta.chunks_received.set(chunk_idx);
-    const is_complete = meta.isComplete();
+    const meta_ptr = state.uploads.getPtr(upload_id) orelse {
+        state.mutex.unlock();
+        try sendResponse(writer, 500, "text/plain", "Upload expired during upload");
+        return;
+    };
+    meta_ptr.*.chunks_received.set(chunk_idx);
+    const is_complete = meta_ptr.*.isComplete();
     state.mutex.unlock();
 
     if (is_complete) {
-        try assembleFile(io, upload_id, meta);
-        try addIPQuota(ip, total_size);
-        try saveMeta(io, upload_id, meta);
+        try assembleFile(io, upload_id, snapshot.total_chunks);
+        try saveMeta(io, upload_id, snapshot);
+        try addIPQuota(ip, snapshot.total_size);
     }
 
     try sendResponse(writer, 200, "application/json", "{\"ok\":true}");
@@ -449,7 +612,7 @@ fn handleConnection(io: Io, stream: net.Stream, addr: net.IpAddress) !void {
     var body_owned = false;
 
     if (req.content_length > 0) {
-        if (req.content_length > CHUNK_SIZE + 1024) {
+        if (req.content_length > MAX_CHUNK_SIZE) {
             try sendResponse(writer, 413, "text/plain", "Chunk too large");
             return;
         }
@@ -472,18 +635,33 @@ fn handleConnection(io: Io, stream: net.Stream, addr: net.IpAddress) !void {
     } else if (std.mem.eql(u8, req.path, "/a.png")) {
         try sendFile(io, writer, "src/a.png", "image/png");
     } else if (std.mem.eql(u8, req.path, "/chunk")) {
-        if (req.upload_id.len == 0 or req.total_chunks == 0) {
-            try sendResponse(writer, 400, "text/plain", "Missing required headers");
+        if (req.upload_id.len == 0 or req.total_chunks == 0 or !isValidId(req.upload_id)) {
+            try sendResponse(writer, 400, "text/plain", "Missing or invalid headers");
             return;
         }
-        try handleChunkRequest(io, addr, req.upload_id, req.chunk_idx, req.total_chunks, req.filename, req.ttl, req.total_size, body, writer);
+        if (req.total_chunks > 1 and req.total_size == 0) {
+            try sendResponse(writer, 400, "text/plain", "Missing total size");
+            return;
+        }
+        const safe_filename = try sanitizeFilename(state.allocator, req.filename);
+        defer state.allocator.free(safe_filename);
+        try handleChunkRequest(io, addr, req.upload_id, req.chunk_idx, req.total_chunks, safe_filename, req.ttl, req.total_size, body, writer);
     } else if (std.mem.startsWith(u8, req.path, "/s/")) {
         const id = req.path[3..];
-        try sendDownload(io, writer, id);
+        if (!isValidId(id)) {
+            try sendResponse(writer, 404, "text/plain", "Not found");
+        } else {
+            try sendDownload(io, writer, id);
+        }
     } else {
         try sendResponse(writer, 404, "text/plain", "Not found");
     }
 }
+
+const ExpiredUpload = struct {
+    id: []u8,
+    total_chunks: u32,
+};
 
 fn cleanupThread(io: Io) !void {
     const cwd = std.Io.Dir.cwd();
@@ -491,34 +669,49 @@ fn cleanupThread(io: Io) !void {
         io.sleep(Io.Duration.fromSeconds(60), .real) catch {};
 
         const now = nowSecs(io);
-        var to_remove = std.ArrayList([]u8).empty;
+        var to_remove = std.ArrayList(ExpiredUpload).empty;
         defer {
-            for (to_remove.items) |id| state.allocator.free(id);
+            for (to_remove.items) |entry| state.allocator.free(entry.id);
             to_remove.deinit(state.allocator);
         }
 
+        // Collect expired uploads under the lock. No `try` here: an allocation
+        // failure must not exit the thread while it still holds the lock
+        // (that would deadlock every other connection) or kill cleanup.
         state.mutex.lock();
         var it = state.uploads.iterator();
         while (it.next()) |entry| {
             const meta = entry.value_ptr.*;
             if (now > meta.created_at + @as(i64, @intCast(meta.ttl_seconds))) {
-                const id = try state.allocator.dupe(u8, entry.key_ptr.*);
-                try to_remove.append(state.allocator, id);
+                const id = state.allocator.dupe(u8, entry.key_ptr.*) catch continue;
+                to_remove.append(state.allocator, .{ .id = id, .total_chunks = meta.total_chunks }) catch {
+                    state.allocator.free(id);
+                };
             }
         }
         state.mutex.unlock();
 
-        for (to_remove.items) |id| {
-            const file_path = std.fmt.allocPrint(state.allocator, "{s}/{s}.bin", .{ DATA_DIR, id }) catch continue;
+        for (to_remove.items) |entry| {
+            // Remove every chunk file too: incomplete uploads leave
+            // `<id>.<n>` files behind that never get deleted otherwise.
+            var i: u32 = 0;
+            while (i < entry.total_chunks) : (i += 1) {
+                const chunk_path = std.fmt.allocPrint(state.allocator, "{s}/{s}.{d}", .{ DATA_DIR, entry.id, i }) catch break;
+                defer state.allocator.free(chunk_path);
+                cwd.deleteFile(io, chunk_path) catch {};
+            }
+
+            const file_path = std.fmt.allocPrint(state.allocator, "{s}/{s}.bin", .{ DATA_DIR, entry.id }) catch continue;
             defer state.allocator.free(file_path);
             cwd.deleteFile(io, file_path) catch {};
 
-            const meta_path = std.fmt.allocPrint(state.allocator, "{s}/{s}.json", .{ META_DIR, id }) catch continue;
+            const meta_path = std.fmt.allocPrint(state.allocator, "{s}/{s}.json", .{ META_DIR, entry.id }) catch continue;
             defer state.allocator.free(meta_path);
             cwd.deleteFile(io, meta_path) catch {};
 
             state.mutex.lock();
-            if (state.uploads.fetchRemove(id)) |kv| {
+            if (state.uploads.fetchRemove(entry.id)) |kv| {
+                state.allocator.free(kv.key);
                 kv.value.deinit();
                 state.allocator.destroy(kv.value);
             }
