@@ -4,9 +4,11 @@ A temporary file sharing service built with Zig 0.16.
 
 ## Features
 
-- **5GB max file size** per upload
-- **10GB daily quota** per IP address
-- **Chunked uploads** (512KB chunks) for resumability and memory efficiency
+- **25GB max file size** per upload
+- **25GB daily quota** per IP address
+- **Chunked uploads** (8MB chunks, 6 parallel streams) for speed and resumability
+- **HTTP keep-alive** connections so chunk streams reuse their TCP/TLS handshake
+- **Direct-to-final-file writes** — chunks land at their byte offset in the final file, no temp chunk files or reassembly pass
 - **Configurable TTL**: 5 min, 15 min, 6h, 48h (default), 2 weeks, 1 month, 3 months
 - **Automatic cleanup** of expired files
 - **Dark mode** frontend with drag & drop support
@@ -63,6 +65,8 @@ GET /s/<upload-id>
 
 - Raw HTTP server using Zig 0.16's `std.Io.net` API
 - Thread-per-connection model with mutex-protected shared state
+- Keep-alive connections (60s idle timeout) so parallel chunk streams avoid repeated handshakes
+- Chunks written directly into `<id>.bin` at their byte offset (sparse file); the file is complete once all chunks arrive — no chunk files, no reassembly step
 - Files stored in `./data/` with metadata in `./data/meta/`
 - Background cleanup thread removes expired files every 60 seconds
 - IP quotas tracked in-memory (reset every 24 hours)

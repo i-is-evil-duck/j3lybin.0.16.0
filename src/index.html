@@ -79,7 +79,7 @@ try{const r=JSON.parse(x.responseText);resolve(r)}catch(err){reject('Invalid res
 };
 x.onerror=()=>reject('Network error');
 x.onabort=()=>reject('Upload aborted');
-x.timeout=30000;
+x.timeout=Math.max(120000,Math.ceil((end-start)/(128*1024))*1000);
 x.ontimeout=()=>reject('Timeout');
 x.open('POST','/chunk');
 x.setRequestHeader('X-Upload-Id',uploadId);
@@ -102,16 +102,23 @@ throw lastErr;
 async function handleFile(file){
 if(!file)return;
 e.textContent='';s.textContent='';p.style.width='0%';
-const maxSize=5*1024*1024*1024;
-if(file.size>maxSize){e.textContent='File too large (max 5GB)';return}
+const maxSize=25*1024*1024*1024;
+if(file.size>maxSize){e.textContent='File too large (max 25GB)';return}
 const ttl=t.value;
 const uploadId=genId();
-const chunkSize=512*1024;
+const chunkSize=8*1024*1024;
 const totalChunks=Math.max(1,Math.ceil(file.size/chunkSize));
 d.style.pointerEvents='none';d.style.opacity='0.6';
 try{
-for(let i=0;i<totalChunks;i++){
+let next=0;
+const worker=async()=>{
+while(true){
+const i=next++;
+if(i>=totalChunks)return;
 await uploadChunk(uploadId,i,totalChunks,file,chunkSize,ttl,file.name);
+}
+};
+await Promise.all(Array.from({length:Math.min(6,totalChunks)},worker));
 }
 p.style.width='100%';
 const div=document.createElement('div');div.className='i';
