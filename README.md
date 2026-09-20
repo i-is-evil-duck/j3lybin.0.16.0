@@ -16,12 +16,13 @@ A temporary file sharing service built with Zig 0.16.
 ## Quick Start (Docker)
 
 ```bash
-# Build and run
+# Build and run (uploaded files persist in the `j3lybin-data` volume)
 docker-compose up --build
 
 # Or with docker directly
 docker build -t j3lybin .
-docker run -p 8080:8080 -v $(pwd)/data:/app/data j3lybin
+docker volume create j3lybin-data
+docker run -p 8080:8080 -v j3lybin-data:/app/data j3lybin
 ```
 
 Then open http://localhost:8080 in your browser.
@@ -67,7 +68,7 @@ GET /s/<upload-id>
 - Thread-per-connection model with mutex-protected shared state
 - Keep-alive connections (60s idle timeout) so parallel chunk streams avoid repeated handshakes
 - Chunks written directly into `<id>.bin` at their byte offset (sparse file); the file is complete once all chunks arrive — no chunk files, no reassembly step
-- Files stored in `./data/` with metadata in `./data/meta/`
+- Files stored in `/app/data/` (docker volume `j3lybin-data`) with metadata in `/app/data/meta/`
 - Background cleanup thread removes expired files every 60 seconds
 - IP quotas tracked in-memory (reset every 24 hours)
 
@@ -79,10 +80,11 @@ j3lybin/
 ├── build.zig.zon       # Package manifest
 ├── Dockerfile          # Multi-stage Docker build
 ├── docker-compose.yml  # Docker Compose config
-├── src/
-│   ├── main.zig        # Server implementation
-│   ├── index.html      # Frontend UI
-│   └── a.png           # Favicon
-└── data/               # Runtime: uploaded files + metadata
-    └── meta/
+└── src/
+    ├── main.zig        # Server implementation
+    ├── index.html      # Frontend UI
+    └── a.png           # Favicon
 ```
+
+Uploaded files and metadata live in the named Docker volume `j3lybin-data`
+(mounted at `/app/data/`), not in the repo.
