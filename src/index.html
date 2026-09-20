@@ -1,3 +1,164 @@
-<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>J3lyBin</title><link rel="icon" type="image/png" href="/a.png"><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:system-ui,sans-serif;max-width:600px;margin:20px auto;padding:10px;background:#0f0f0f;color:#fff}#d{border:3px dashed #333;padding:40px 20px;text-align:center;border-radius:12px;cursor:pointer;transition:.2s;touch-action:manipulation;-webkit-tap-highlight-color:transparent}#d:hover,#d.drag{border-style:solid;background:#334}#f{display:none}select{background:#333;color:#fff;border:1px solid #444;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:14px;width:100%}.i{display:flex;justify-content:space-between;align-items:center;padding:12px;margin:8px 0;background:#1a1a1a;border-radius:8px;gap:10px;font-size:14px}.n{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#888;font-size:12px}a{text-decoration:none;word-break:break-all;color:#fff;font-size:12px}a:hover{text-decoration:underline}button{background:#333;color:#fff;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;touch-action:manipulation}button:hover{background:#444}#p{height:3px;width:0;background:#4a4;transition:.3s;position:fixed;top:0;left:0}#e{color:#f44;font-size:12px;margin-top:8px;text-align:center}#s{font-size:12px;color:#666;text-align:center;margin-top:8px}</style><body><div id="p"></div><h1 style="text-align:center;font-size:24px">J3lyBin</h1><p style="color:#666;margin:10px 0;text-align:center;font-size:14px">≽^•⩊•^≼</p><select id="t"><option value="5m">5 min</option><option value="15m">15 min</option><option value="48h" selected>48 hours</option><option value="6h">6 hours</option><option value="2w">2 weeks</option><option value="1M">1 month</option><option value="3M">3 months</option></select><div id="d"><p style="font-size:16px">Tap to select file</p><p id="e"></p></div><div id="l"></div><div id="s"></div><script>
-(function(){const $=id=>document.getElementById(id),d=$("d"),f=document.createElement("input"),l=$("l"),p=$("p"),t=$("t"),e=$("e"),s=$("s");f.type="file";f.style.display="none";document.body.appendChild(f);function genId(){const c="abcdefghijklmnopqrstuvwxyz0123456789",r=new Uint8Array(6);crypto.getRandomValues(r);return Array.from(r,x=>c[x%c.length]).join("")}function fmtSize(b){if(b<1024)return b+"B";if(b<1048576)return(b/1024).toFixed(1)+"KB";return(b/1048576).toFixed(1)+"MB"}let totalBytes=0;let got=null;function updateProgress(){if(!got)return;let total=0;for(const g of got)total+=g;const pct=Math.min(100,total/totalBytes*100);p.style.width=pct+"%";s.textContent=`${fmtSize(total)}/${fmtSize(totalBytes)} (${Math.round(pct)}%)`}async function uploadChunkOnce(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename){const start=chunkIdx*chunkSize;const end=Math.min(start+chunkSize,file.size);const blob=file.slice(start,end);return new Promise((resolve,reject)=>{const x=new XMLHttpRequest;x.upload.onprogress=ev=>{if(ev.lengthComputable){got[chunkIdx]=Math.max(got[chunkIdx]||0,ev.loaded);updateProgress()}};x.onload=()=>{if(x.status===200){got[chunkIdx]=end-start;updateProgress();try{const r=JSON.parse(x.responseText);resolve(r)}catch(err){reject("Invalid response")}}else{reject(x.responseText||"HTTP "+x.status)}};x.onerror=()=>reject("Network error");x.onabort=()=>reject("Upload aborted");x.timeout=Math.max(12e4,Math.ceil((end-start)/(128*1024))*1e3);x.ontimeout=()=>reject("Timeout");x.open("POST","/chunk");x.setRequestHeader("X-Upload-Id",uploadId);x.setRequestHeader("X-Chunk-Index",String(chunkIdx));x.setRequestHeader("X-Total-Chunks",String(totalChunks));x.setRequestHeader("X-Filename",encodeURIComponent(filename));x.setRequestHeader("X-Ttl",ttl);x.setRequestHeader("X-Total-Size",String(file.size));x.send(blob)})}async function uploadChunk(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename){let lastErr;for(let attempt=0;attempt<3;attempt++){try{return await uploadChunkOnce(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename)}catch(err){lastErr=err;if(attempt<2)await new Promise(r=>setTimeout(r,500))}}throw lastErr}async function handleFile(file){if(!file)return;e.textContent="";s.textContent="";p.style.width="0%";const maxSize=25*1024*1024*1024;if(file.size>maxSize){e.textContent="File too large (max 25GB)";return}const ttl=t.value;const uploadId=genId();const chunkSize=8*1024*1024;const totalChunks=Math.max(1,Math.ceil(file.size/chunkSize));totalBytes=file.size;got=new Array(totalChunks).fill(0);d.style.pointerEvents="none";d.style.opacity="0.6";try{let next=0;const worker=async()=>{while(true){const i=next++;if(i>=totalChunks)return;await uploadChunk(uploadId,i,totalChunks,file,chunkSize,ttl,file.name)}};await Promise.all(Array.from({length:Math.min(6,totalChunks)},worker));p.style.width="100%";const div=document.createElement("div");div.className="i";const url=location.origin+"/s/"+uploadId;div.innerHTML=`<a href="${url}" target="_blank">${url}</a><button onclick="navigator.clipboard.writeText('${url}')">Copy</button>`;l.prepend(div);s.textContent="Done!";setTimeout(()=>{p.style.width="0";s.textContent=""},2e3)}catch(err){e.textContent="Error: "+err;s.textContent="";p.style.width="0"}finally{d.style.pointerEvents="";d.style.opacity=""}}d.addEventListener("click",()=>f.click());d.addEventListener("touchstart",ev=>{ev.preventDefault();f.click()},{passive:false});f.addEventListener("change",ev=>{const files=ev.target.files;if(files.length>0){handleFile(files[0])}f.value=""});let dragCount=0;d.addEventListener("dragenter",ev=>{ev.preventDefault();dragCount++;d.classList.add("drag")});d.addEventListener("dragleave",ev=>{ev.preventDefault();dragCount--;if(dragCount===0)d.classList.remove("drag")});d.addEventListener("dragover",ev=>ev.preventDefault());d.addEventListener("drop",ev=>{ev.preventDefault();dragCount=0;d.classList.remove("drag");const files=ev.dataTransfer.files;if(files.length>0)handleFile(files[0])});document.addEventListener("visibilitychange",()=>{if(document.hidden){s.textContent="Upload paused - don't switch tabs"}})})();
-</script></body></html>
+<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>J3lyBin</title>
+<link rel="icon" type="image/png" href="/a.png">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;max-width:600px;margin:20px auto;padding:10px;background:#0f0f0f;color:#fff}
+#d{border:3px dashed #333;padding:40px 20px;text-align:center;border-radius:12px;cursor:pointer;transition:.2s;touch-action:manipulation;-webkit-tap-highlight-color:transparent}
+#d:hover,#d.drag{border-style:solid;background:#334}
+select{background:#333;color:#fff;border:1px solid #444;padding:8px 12px;border-radius:6px;margin-bottom:10px;font-size:14px;width:100%}
+.i{display:flex;justify-content:space-between;align-items:center;padding:12px;margin:8px 0;background:#1a1a1a;border-radius:8px;gap:10px;font-size:14px}
+.n{max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#888;font-size:12px}
+a{text-decoration:none;word-break:break-all;color:#fff;font-size:12px}
+a:hover{text-decoration:underline}
+button{background:#333;color:#fff;border:none;padding:6px 12px;border-radius:4px;cursor:pointer;touch-action:manipulation}
+button:hover{background:#444}
+#p{height:3px;width:0;background:#4a4;transition:.3s;position:fixed;top:0;left:0}
+#e{color:#f44;font-size:12px;margin-top:8px;text-align:center}
+#s{font-size:12px;color:#666;text-align:center;margin-top:8px}
+</style>
+</head>
+<body>
+<div id="p"></div>
+<h1 style="text-align:center;font-size:24px">J3lyBin</h1>
+<p style="color:#666;margin:10px 0;text-align:center;font-size:14px">≽^•⩊•^≼</p>
+<select id="t">
+<option value="5m">5 min</option>
+<option value="15m">15 min</option>
+<option value="48h" selected>48 hours</option>
+<option value="6h">6 hours</option>
+<option value="2w">2 weeks</option>
+<option value="1M">1 month</option>
+<option value="3M">3 months</option>
+</select>
+<div id="d"><p style="font-size:16px">Tap to select file</p><p id="e"></p></div>
+<div id="l"></div>
+<div id="s"></div>
+<script>
+(function(){
+const $=id=>document.getElementById(id),d=$("d"),f=document.createElement("input"),l=$("l"),p=$("p"),t=$("t"),e=$("e"),s=$("s");
+f.type="file";f.style.display="none";document.body.appendChild(f);
+function genId(){const c="abcdefghijklmnopqrstuvwxyz0123456789",r=new Uint8Array(6);crypto.getRandomValues(r);return Array.from(r,x=>c[x%c.length]).join("")}
+function fmtSize(b){if(b<1024)return b+"B";if(b<1048576)return(b/1024).toFixed(1)+"KB";return(b/1048576).toFixed(1)+"MB"}
+let totalBytes=0;let got=null;
+function updateProgress(){if(!got)return;let total=0;for(const g of got)total+=g;const pct=Math.min(100,total/totalBytes*100);p.style.width=pct+"%";s.textContent=`${fmtSize(total)}/${fmtSize(totalBytes)} (${Math.round(pct)}%)`}
+// ── persistent links ────────────────────────────────────────────────
+const STORAGE_KEY="zigbin_links";
+function parseTtlSeconds(ttl){
+  if(!ttl||ttl.length<2)return 48*3600;
+  const n=parseInt(ttl.slice(0,-1),10);
+  if(isNaN(n))return 48*3600;
+  const u=ttl.slice(-1);
+  let m;
+  switch(u){
+    case 'm':m=60;break;
+    case 'h':m=3600;break;
+    case 'd':m=86400;break;
+    case 'w':m=7*86400;break;
+    case 'M':m=30*86400;break;
+    default:return 48*3600;
+  }
+  let v=n*m;
+  if(v>180*86400)v=180*86400;
+  return v;
+}
+function loadLinks(){
+  try{
+    const raw=localStorage.getItem(STORAGE_KEY);
+    if(!raw)return[];
+    const arr=JSON.parse(raw);
+    const now=Date.now();
+    const filtered=arr.filter(x=>x.expiresAt>now);
+    if(filtered.length!==arr.length)saveLinks(filtered);
+    return filtered;
+  }catch{return[]}
+}
+function saveLinks(a){try{localStorage.setItem(STORAGE_KEY,JSON.stringify(a));}catch{}}
+function escapeHtml(str){return str.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");}
+function renderLink(entry){
+  const div=document.createElement("div");div.className="i";div.dataset.id=entry.id;
+  const name=entry.filename||"file";
+  const shortName=name.length>24?name.slice(0,24)+"\u2026":name;
+  div.innerHTML=`<a href="${entry.url}" target="_blank">${entry.url}</a><span class="n" title="${escapeHtml(name)}">${escapeHtml(shortName)}</span><button onclick="navigator.clipboard.writeText('${entry.url}')">Copy</button>`;
+  return div;
+}
+function renderAll(){
+  l.innerHTML="";
+  const links=loadLinks();
+  for(const entry of links) l.appendChild(renderLink(entry));
+}
+function addLink(id,filename,ttl){
+  const url=location.origin+"/s/"+id;
+  const ttlSec=parseTtlSeconds(ttl);
+  const now=Date.now();
+  const entry={id,url,filename,ttl,createdAt:now,expiresAt:now+ttlSec*1000};
+  const links=loadLinks();
+  links.unshift(entry);
+  if(links.length>50)links.length=50;
+  saveLinks(links);
+  l.prepend(renderLink(entry));
+}
+function cleanupExpired(){
+  const links=loadLinks();
+  const ids=new Set(links.map(x=>x.id));
+  for(const el of Array.from(l.children)){
+    const id=el.dataset.id;
+    if(id&&!ids.has(id))el.remove();
+  }
+}
+renderAll();
+setInterval(cleanupExpired,30000);
+// ── upload ──────────────────────────────────────────────────────────
+async function uploadChunkOnce(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename){
+  const start=chunkIdx*chunkSize;const end=Math.min(start+chunkSize,file.size);const blob=file.slice(start,end);
+  return new Promise((resolve,reject)=>{
+    const x=new XMLHttpRequest;
+    x.upload.onprogress=ev=>{if(ev.lengthComputable){got[chunkIdx]=Math.max(got[chunkIdx]||0,ev.loaded);updateProgress()}};
+    x.onload=()=>{if(x.status===200){got[chunkIdx]=end-start;updateProgress();try{const r=JSON.parse(x.responseText);resolve(r)}catch(err){reject("Invalid response")}}else{reject(x.responseText||"HTTP "+x.status)}};
+    x.onerror=()=>reject("Network error");x.onabort=()=>reject("Upload aborted");
+    x.timeout=Math.max(12e4,Math.ceil((end-start)/(128*1024))*1e3);x.ontimeout=()=>reject("Timeout");
+    x.open("POST","/chunk");x.setRequestHeader("X-Upload-Id",uploadId);x.setRequestHeader("X-Chunk-Index",String(chunkIdx));x.setRequestHeader("X-Total-Chunks",String(totalChunks));x.setRequestHeader("X-Filename",encodeURIComponent(filename));x.setRequestHeader("X-Ttl",ttl);x.setRequestHeader("X-Total-Size",String(file.size));x.send(blob)
+  });
+}
+async function uploadChunk(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename){
+  let lastErr;
+  for(let attempt=0;attempt<3;attempt++){
+    try{return await uploadChunkOnce(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename)}
+    catch(err){lastErr=err;if(attempt<2)await new Promise(r=>setTimeout(r,500))}}
+  throw lastErr
+}
+async function handleFile(file){
+  if(!file)return;
+  e.textContent="";s.textContent="";p.style.width="0%";
+  const maxSize=25*1024*1024*1024;
+  if(file.size>maxSize){e.textContent="File too large (max 25GB)";return}
+  const ttl=t.value;const uploadId=genId();const chunkSize=64*1024*1024;
+  const totalChunks=Math.max(1,Math.ceil(file.size/chunkSize));
+  totalBytes=file.size;got=new Array(totalChunks).fill(0);
+  d.style.pointerEvents="none";d.style.opacity="0.6";
+  try{
+    let next=0;
+    const worker=async()=>{while(true){const i=next++;if(i>=totalChunks)return;await uploadChunk(uploadId,i,totalChunks,file,chunkSize,ttl,file.name)}};
+    await Promise.all(Array.from({length:Math.min(6,totalChunks)},worker));
+    p.style.width="100%";
+    addLink(uploadId,file.name,ttl);
+    s.textContent="Done!";setTimeout(()=>{p.style.width="0";s.textContent=""},2000)
+  }catch(err){e.textContent="Error: "+err;s.textContent="";p.style.width="0"}
+  finally{d.style.pointerEvents="";d.style.opacity=""}
+}
+d.addEventListener("click",()=>f.click());
+d.addEventListener("touchstart",ev=>{ev.preventDefault();f.click()},{passive:false});
+f.addEventListener("change",ev=>{const files=ev.target.files;if(files.length>0){handleFile(files[0])}f.value=""});
+let dragCount=0;
+d.addEventListener("dragenter",ev=>{ev.preventDefault();dragCount++;d.classList.add("drag")});
+d.addEventListener("dragleave",ev=>{ev.preventDefault();dragCount--;if(dragCount===0)d.classList.remove("drag")});
+d.addEventListener("dragover",ev=>ev.preventDefault());
+d.addEventListener("drop",ev=>{ev.preventDefault();dragCount=0;d.classList.remove("drag");const files=ev.dataTransfer.files;if(files.length>0)handleFile(files[0])});
+document.addEventListener("visibilitychange",()=>{if(document.hidden){s.textContent="Upload paused - don't switch tabs"}})
+})();
+</script>
+</body>
+</html>
