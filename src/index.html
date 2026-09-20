@@ -19,6 +19,7 @@ button:hover{background:#444}
 #p{height:3px;width:0;background:#4a4;transition:.3s;position:fixed;top:0;left:0}
 #e{color:#f44;font-size:12px;margin-top:8px;text-align:center}
 #s{font-size:12px;color:#666;text-align:center;margin-top:8px}
+.countdown{font-size:11px;color:#aaa;min-width:60px;text-align:right;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -82,7 +83,7 @@ function renderLink(entry){
   const div=document.createElement("div");div.className="i";div.dataset.id=entry.id;
   const name=entry.filename||"file";
   const shortName=name.length>24?name.slice(0,24)+"\u2026":name;
-  div.innerHTML=`<a href="${entry.url}" target="_blank">${entry.url}</a><span class="n" title="${escapeHtml(name)}">${escapeHtml(shortName)}</span><button onclick="navigator.clipboard.writeText('${entry.url}')">Copy</button>`;
+  div.innerHTML=`<a href="${entry.url}" target="_blank">${entry.url}</a><span class="n" title="${escapeHtml(name)}">${escapeHtml(shortName)}</span><span class="countdown" data-expires="${entry.expiresAt}"></span><button onclick="navigator.clipboard.writeText('${entry.url}')">Copy</button>`;
   return div;
 }
 function renderAll(){
@@ -101,6 +102,26 @@ function addLink(id,filename,ttl){
   saveLinks(links);
   l.prepend(renderLink(entry));
 }
+function formatRemaining(ms){
+  if(ms<=0)return "expired";
+  const s=Math.floor(ms/1000);
+  const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60),sec=s%60;
+  if(d>0)return d+"d "+h+"h";
+  if(h>0)return h+"h "+m+"m";
+  if(m>0)return m+"m "+sec+"s";
+  return sec+"s";
+}
+function updateCountdowns(){
+  const now=Date.now();
+  for(const el of Array.from(l.children)){
+    const cd=el.querySelector(".countdown");
+    if(!cd)continue;
+    const exp=parseInt(cd.dataset.expires,10);
+    const rem=exp-now;
+    cd.textContent=formatRemaining(rem);
+    if(rem<=0)cd.style.color="#f66";
+  }
+}
 function cleanupExpired(){
   const links=loadLinks();
   const ids=new Set(links.map(x=>x.id));
@@ -110,7 +131,8 @@ function cleanupExpired(){
   }
 }
 renderAll();
-setInterval(cleanupExpired,30000);
+updateCountdowns();
+setInterval(()=>{updateCountdowns();cleanupExpired();},1000);
 // ── upload ──────────────────────────────────────────────────────────
 async function uploadChunkOnce(uploadId,chunkIdx,totalChunks,file,chunkSize,ttl,filename){
   const start=chunkIdx*chunkSize;const end=Math.min(start+chunkSize,file.size);const blob=file.slice(start,end);
