@@ -1,5 +1,7 @@
-# J3lyBin
+# J3lyBin  <br />  <img alt="Stargazers" src="https://img.shields.io/github/stars/i-is-evil-duck/j3lybin.0.16.0?style=for-the-badge&logo=starship&color=C9CBFF&logoColor=D9E0EE&labelColor=302D41">
 
+
+## J3lyBin
 A temporary file sharing service built with Zig 0.16.
 
 ## Features
@@ -88,3 +90,16 @@ j3lybin/
 
 Uploaded files and metadata live in the named Docker volume `j3lybin-data`
 (mounted at `/app/data/`), not in the repo.
+
+## Downloads
+
+Download the pre-built executables from the [releases](https://github.com/i-is-evil-duck/j3lybin.0.16.0/releases) page.
+
+| Platform | File |
+|----------|------|
+| Linux | `j3lybin` |
+| Docker | `docker-compose up --build` |
+
+## Views
+
+<img src="https://count.getloli.com/get/@J3lybin?theme=rule34" />
