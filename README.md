@@ -102,4 +102,4 @@ Download the pre-built executables from the [releases](https://github.com/i-is-e
 
 ## Views
 
-<img src="https://count.getloli.com/get/@J3lybin?theme=rule34" />
+<img src="http://moe.j3ly.com/@j3ly-bin-v2?name=j3ly-bin-v2&theme=rule34&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=0&id=75814d8a" />
